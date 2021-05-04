@@ -15,7 +15,10 @@ import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-from ignite.metrics import Accuracy, Precision
+from ignite.metrics import Accuracy, Precision, Recall
+
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 import drn as models
 from drn_seg import DRNSub
@@ -61,7 +64,6 @@ def parse_args():
                         help='use pre-trained model')
     parser.add_argument('--lr-adjust', dest='lr_adjust',
                         choices=['linear', 'step'], default='step')
-#     parser.add_argument("--local_rank", type=int)
     parser.add_argument('--crop-size', dest='crop_size', type=int, default=224)
     parser.add_argument('--scale-size', dest='scale_size', type=int, default=256)
     parser.add_argument('--step-ratio', dest='step_ratio', type=float, default=0.1)
@@ -73,7 +75,6 @@ def parse_args():
 def main():
     print(' '.join(sys.argv))
     args = parse_args()
-#     torch.cuda.set_device(args.local_rank)
     print(args)
     if args.cmd == 'train':
         run_training(args)
@@ -83,14 +84,10 @@ def main():
 
 def run_training(args):
     # create model
-#     model = models.__dict__[args.arch](args.pretrained, num_classes=args.num_classes)
     model = DRNSub(args.pretrained, num_classes=args.num_classes)
     model = torch.nn.DataParallel(model).cuda()
-    
-#     torch.distributed.init_process_group('nccl')
-#     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank).cuda()
 
-    best_prec1 = 0
+    best_acc = 0
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -98,7 +95,7 @@ def run_training(args):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
-            best_prec1 = checkpoint['best_prec1']
+            best_acc = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
@@ -113,10 +110,12 @@ def run_training(args):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
     
+    # Data Augmentation and Conversion to Tensor
     train_set = datasets.ImageFolder(traindir, transforms.Compose([
             transforms.Resize((224, 224)),
-#             transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.RandomPerspective(),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -126,10 +125,10 @@ def run_training(args):
     
     print(train_set.class_to_idx)
 
+    #No data augmentation run when loading validation set
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
             transforms.Resize((224, 224)),
-#             transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ])),
@@ -139,16 +138,18 @@ def run_training(args):
     # define loss function (criterion) and pptimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-#     optimizer = torch.optim.SGD(model.parameters(), args.lr,
-#                                 momentum=args.momentum,
-#                                 weight_decay=args.weight_decay)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
+    #Scheduler reduces lr after 5 epochs without loss reduction in validation
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
     
     tloss = []
     vloss = []
 
     for epoch in range(args.start_epoch, args.epochs):
-        adjust_learning_rate(args, optimizer, epoch)
+        
+        for param_group in optimizer.param_groups:
+            print('Epoch [{}] Learning rate: {}'.format(epoch, param_group['lr']))
 
         # train for one epoch
         ctloss = train(args, train_loader, model, criterion, optimizer, epoch)
@@ -156,18 +157,21 @@ def run_training(args):
         
 
         # evaluate on validation set
-        prec1, cvloss = validate(args, val_loader, model, criterion)
+        vacc, cvloss = validate(args, val_loader, model, criterion)
         vloss.append(cvloss)
-        # remember best prec@1 and save checkpoint
-        is_best = prec1 > best_prec1
-        best_prec1 = max(prec1, best_prec1)
+        scheduler.step(cvloss)
+        
+        
+        # remember best acc and save checkpoint
+        is_best = vacc > best_acc
+        best_acc = max(prec1, best_acc)
         
         checkpoint_path = 'checkpoint_latest.pth.tar'
         save_checkpoint({
             'epoch': epoch + 1,
             'arch': args.arch,
             'state_dict': model.state_dict(),
-            'best_prec1': best_prec1,
+            'best_prec1': best_acc,
         }, is_best, filename=checkpoint_path)
         if (epoch + 1) % args.check_freq == 0:
             history_path = 'checkpoint_{:03d}.pth.tar'.format(epoch + 1)
@@ -180,9 +184,6 @@ def test_model(args):
     # create model
     model = DRNSub(args.pretrained, num_classes=args.num_classes)
     model = torch.nn.DataParallel(model).cuda()
-    
-#     torch.distributed.init_process_group('nccl')
-#     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank).cuda()
 
     if args.resume:
         if os.path.isfile(args.resume):
@@ -203,11 +204,12 @@ def test_model(args):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
+    #Same as val loader in training
     t = transforms.Compose([
-        transforms.Resize(args.scale_size),
-        transforms.CenterCrop(args.crop_size),
-        transforms.ToTensor(),
-        normalize])
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            normalize,
+        ])
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, t),
         batch_size=args.batch_size, shuffle=False,
@@ -219,11 +221,10 @@ def test_model(args):
 
 def train(args, train_loader, model, criterion, optimizer, epoch):
     batch_time = AverageMeter()
-    data_time = AverageMeter()
     losses = AverageMeter()
     acc = Accuracy()
     prec = Precision()
-#     top1 = AverageMeter()
+    recall = Recall()
 
     # switch to train mode
     model.train()
@@ -231,8 +232,6 @@ def train(args, train_loader, model, criterion, optimizer, epoch):
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
-        data_time.update(time.time() - end)
-
         target = target.cuda(non_blocking=True)
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
@@ -241,13 +240,11 @@ def train(args, train_loader, model, criterion, optimizer, epoch):
         output = model(input_var)
         loss = criterion(output, target_var)
 
-        # measure accuracy and record loss
+        # measure metrics and record loss
         acc.update((output, target_var))
         prec.update((output, target_var))
-#         prec1 = accuracy(output, target)[0]
+        recall.update((output, target_var))
         losses.update(loss.item(), input.size(0))
-#         top1.update(prec1.item(), input.size(0))
-#         top5.update(prec5[0], input.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -256,19 +253,22 @@ def train(args, train_loader, model, criterion, optimizer, epoch):
 
         # measure elapsed time
         batch_time.update(time.time() - end)
-        end = time.time()
 
         if i % args.print_freq == 0:
             atmp = acc.compute()*100
             ptmp = [round(elem*100, 2) for elem in prec.compute().tolist()]
+            rtmp = [round(elem*100, 2) for elem in recall.compute().tolist()]
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Acc {acc:.2f}\t'
-                  'Prec {prec}'.format(
+                  'Prec {prec}\t'
+                  'Recall {rec}'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, acc=atmp, prec=ptmp))
+                   loss=losses, acc=atmp, prec=ptmp, rec=rtmp))
+            
+        #update end for next cycle
+        end = time.time()
     return losses.avg
 
 
@@ -277,10 +277,11 @@ def validate(args, val_loader, model, criterion):
     losses = AverageMeter()
     acc = Accuracy()
     prec = Precision()
-#     top5 = AverageMeter()
+    recall = Recall()
 
     # switch to evaluate mode
     model.eval()
+    
     with torch.no_grad():
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
@@ -292,31 +293,38 @@ def validate(args, val_loader, model, criterion):
             output = model(input_var)
             loss = criterion(output, target_var)
 
-            # measure accuracy and record loss
-#             prec1 = accuracy(output.data, target)[0]
+            # measure metrics and record loss
             acc.update((output, target_var))
             prec.update((output, target_var))
+            recall.update((output, target_var))
             losses.update(loss.item(), input.size(0))
-#             top1.update(prec1.item(), input.size(0))
-    #         top5.update(prec5[0], input.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
-            end = time.time()
+            
 
             if i % args.print_freq == 0:
                 atmp = acc.compute()*100
                 ptmp = [round(elem*100, 2) for elem in prec.compute().tolist()]
+                rtmp = [round(elem*100, 2) for elem in recall.compute().tolist()]
                 print('Test: [{0}/{1}]\t'
                       'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                       'Acc {acc:.2f}\t'
-                      'Prec {prec}'.format(
-                       i, len(val_loader), batch_time=batch_time, loss=losses,acc=atmp, prec=ptmp))
+                      'Prec {prec}'
+                      'Recall {rec}'.format(
+                       i, len(val_loader), batch_time=batch_time, loss=losses,acc=atmp, prec=ptmp, rec=rtmp))\
+            
+            end = time.time()
+
+    # Print overall metrics after running entire validation set
     atmp = acc.compute()*100
     ptmp = [round(elem*100, 2) for elem in prec.compute().tolist()]
-    print(' * Acc {acc:.2f}\t'
-          'Prec {prec}'.format(acc=atmp, prec=ptmp))
+    rtmp = [round(elem*100, 2) for elem in recall.compute().tolist()]
+    print('Final Results: * Acc {acc:.2f}\t'
+          'Loss {loss.avg:.4f}\t'
+          'Prec {prec}\t'
+          'Recall {rec}'.format(acc=atmp, loss=losses, prec=ptmp, rec = rtmp))
 
     return acc.compute()*100, losses.avg
 
@@ -343,30 +351,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
-
-def adjust_learning_rate(args, optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (args.step_ratio ** (epoch // 30))
-    print('Epoch [{}] Learning rate: {}'.format(epoch, lr))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-def accuracy(output, target, topk=(1,)):
-    """Computes the precision@k for the specified values of k"""
-    maxk = max(topk)
-    batch_size = target.size(0)
-
-    _, pred = output.topk(maxk, 1, True, True)
-    pred = pred.t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-    res = []
-    for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
-        res.append(correct_k.mul_(100.0 / batch_size))
-    return res
 
 
 if __name__ == '__main__':
